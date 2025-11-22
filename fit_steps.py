@@ -3,19 +3,21 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from dateutil import tz
-
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-SCOPES = ["https://www.googleapis.com/auth/fitness.activity.write"]
-DATA_SOURCE_ID = "raw:com.google.step_count.delta:GitHubCopilot:synthetic_steps"
+# Scopes required to read/write activity data
+SCOPES = ["https://www.googleapis.com/auth/fitness.activity.write", "https://www.googleapis.com/auth/fitness.activity.read"]
+
+# We removed the hardcoded DATA_SOURCE_ID constant to prevent project number errors.
 DATA_STREAM_NAME = "Synthetic Steps"
 APPLICATION_NAME = "SyntheticStepUploader"
 
@@ -29,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min", type=int, default=5000, help="Global minimum steps per day")
     parser.add_argument("--max", type=int, default=12000, help="Global maximum steps per day")
     parser.add_argument("--ranges", help="Comma list of per-date overrides: YYYY-MM-DD:min-max")
-    parser.add_argument("--timezone", default=str(tz.tzlocal()), help="Timezone name (e.g. UTC, America/Los_Angeles)")
+    parser.add_argument("--timezone", default=time.tzname[0], help="Timezone name (e.g. UTC, America/Los_Angeles)")
     parser.add_argument("--dry-run", action="store_true", help="Do not upload, just display planned steps")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     return parser.parse_args()
@@ -53,12 +55,24 @@ def load_credentials() -> Credentials:
     return creds
 
 
-def ensure_data_source(service) -> None:
+def ensure_data_source(service) -> str:
+    """
+    Checks if the data source exists. If not, creates it without specifying the ID,
+    allowing Google to generate the correct ID with the Project Number.
+    Returns the valid dataSourceId.
+    """
     try:
+        # 1. List existing sources to see if we already created one
         existing_sources = service.users().dataSources().list(userId="me").execute()
         for ds in existing_sources.get("dataSource", []):
-            if ds.get("dataStreamId") == DATA_SOURCE_ID:
-                return  # exists
+            # We match based on Stream Name and App Name
+            if (ds.get("dataStreamName") == DATA_STREAM_NAME and 
+                ds.get("application", {}).get("name") == APPLICATION_NAME):
+                print(f"Found existing data source: {ds['dataStreamId']}")
+                return ds['dataStreamId']
+
+        # 2. Create new source if not found
+        print("Creating new data source...")
         body = {
             "dataStreamName": DATA_STREAM_NAME,
             "type": "raw",
@@ -66,10 +80,15 @@ def ensure_data_source(service) -> None:
             "dataType": {
                 "name": "com.google.step_count.delta",
                 "field": [{"name": "steps", "format": "integer"}]
-            },
-            "dataStreamId": DATA_SOURCE_ID
+            }
+            # NOTE: We do NOT include "dataStreamId" here. 
+            # Google will generate it using the correct Project Number.
         }
-        service.users().dataSources().create(userId="me", body=body).execute()
+        response = service.users().dataSources().create(userId="me", body=body).execute()
+        new_id = response['dataStreamId']
+        print(f"Created new data source: {new_id}")
+        return new_id
+
     except HttpError as e:
         print(f"Failed ensuring data source: {e}")
         sys.exit(1)
@@ -135,8 +154,12 @@ def to_ns(dt_obj: datetime) -> int:
 def build_points(step_map: Dict[date, int], tzinfo) -> List[Dict]:
     points = []
     for d, steps in step_map.items():
+        # Start of day in specific timezone
         start_dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tzinfo)
+        # End of day (start + 24h minus 1 nanosecond technically, but straight logic handles ranges)
         end_dt = start_dt + timedelta(days=1)
+        
+        # Google Fit requires strict nanosecond ranges
         points.append({
             "startTimeNanos": str(to_ns(start_dt)),
             "endTimeNanos": str(to_ns(end_dt)),
@@ -146,31 +169,45 @@ def build_points(step_map: Dict[date, int], tzinfo) -> List[Dict]:
     return points
 
 
-def upload_steps(service, points: List[Dict], tzinfo, verbose: bool):
+def upload_steps(service, points: List[Dict], tzinfo, verbose: bool, data_source_id: str):
     if not points:
         print("No points to upload")
         return
+        
     start_ns = points[0]["startTimeNanos"]
     end_ns = points[-1]["endTimeNanos"]
+    
+    # The dataset ID is a range: min-max
     dataset_id = f"{start_ns}-{end_ns}"
+    
     body = {
-        "dataSourceId": DATA_SOURCE_ID,
+        "dataSourceId": data_source_id,
         "minStartTimeNs": start_ns,
         "maxEndTimeNs": end_ns,
         "point": points
     }
+    
     try:
         if verbose:
-            print(json.dumps(body, indent=2)[:1000])
+            print(f"Uploading to {data_source_id}...")
+            print(json.dumps(body, indent=2)[:500] + "... (truncated)")
+            
         service.users().dataSources().datasets().patch(
             userId="me",
-            dataSourceId=DATA_SOURCE_ID,
+            dataSourceId=data_source_id,
             datasetId=dataset_id,
             body=body
         ).execute()
-        print(f"Uploaded {len(points)} day(s) of step data.")
+        print(f"Successfully uploaded {len(points)} day(s) of step data.")
+        
     except HttpError as e:
         print(f"Upload failed: {e}")
+        # Often useful to see full error detail
+        try:
+            error_details = json.loads(e.content.decode('utf-8'))
+            print(json.dumps(error_details, indent=2))
+        except:
+            pass
         sys.exit(1)
 
 
@@ -195,16 +232,13 @@ def main():
 
     creds = load_credentials()
     service = build("fitness", "v1", credentials=creds, cache_discovery=False)
-    ensure_data_source(service)
+    
+    # Dynamically get the correct Data Source ID
+    data_source_id = ensure_data_source(service)
+    
     points = build_points(steps_map, tzinfo)
-    upload_steps(service, points, tzinfo, args.verbose)
+    upload_steps(service, points, tzinfo, args.verbose, data_source_id)
 
 
 if __name__ == "__main__":
     main()
-
-# Example usage:
-# python -m venv .venv
-# .venv\Scripts\activate
-# pip install -r requirements.txt
-# python fit_steps.py --date 2025-11-20 --min 8000 --max 11000 --dry-run

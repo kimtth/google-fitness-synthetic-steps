@@ -191,3 +191,5 @@ cython_debug/
 .venv
 .python-version
 uv.lock
+token.json
+client_secrets.json

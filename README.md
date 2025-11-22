@@ -34,19 +34,24 @@ python fit_steps.py --start-date 2025-11-01 --end-date 2025-11-03 --min 5000 --m
 ```
 
 ## 🔧 Setup
-1. Enable Google Fitness API in a Google Cloud project.
-2. Create Desktop OAuth client; save JSON as `client_secrets.json` here.
-3. Install:
+
+Install:
 ```bash
 uv sync
 ```
-4. First run launches browser; saves `token.json`.
+
+1. Enable Google Fitness API in a Google Cloud project.
+2. Create Desktop OAuth client; save JSON as client_secrets.json in this directory.
+3. Run the script; authenticate via browser on first run.
 
 ## 🗃 Data Source
-ID: `raw:com.google.step_count.delta:GitHubCopilot:synthetic_steps` (created automatically). Field: `steps` (integer).
+ID: `raw:com.google.step_count.delta:<Project Number>:Synthetic Steps`
+
+Note: The Project Number is auto-detected from your credentials to comply with API requirements. The script creates this automatically.
 
 ## 🔐 Scope
 `https://www.googleapis.com/auth/fitness.activity.write`
+`https://www.googleapis.com/auth/fitness.activity.read`
 
 ## ⏰ Timezone
 - Local system default; override with `--timezone UTC` (etc.).
